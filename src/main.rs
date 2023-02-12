@@ -46,6 +46,13 @@ struct Opt {
         help = "Prefixing the filename with its index in the playlist"
     )]
     ordered: bool,
+    #[structopt(
+        short = "f",
+        long = "filetype",
+        default_value = "flac",
+        help = "Filetype to download (flac or mp3)"
+    )]
+    filetype: String,
 }
 
 #[derive(Clone)]
@@ -79,6 +86,7 @@ async fn download_tracks(
     destination: PathBuf,
     tracks: Vec<SpotifyId>,
     ordered: bool,
+    filetype: String,
 ) {
     let player_config = PlayerConfig::default();
     let bar_style = ProgressStyle::default_bar()
@@ -117,10 +125,11 @@ async fn download_tracks(
         let full_track_name_clean = make_filename_compatible(full_track_name.as_str());
         //let filename = format!("{}.flac", full_track_name_clean);
         let filename: String;
+        let filetype = filetype.to_lowercase();
         if ordered {
-            filename = format!("{:03} - {}.flac", i + 1, full_track_name_clean);
+            filename = format!("{:03} - {}.{}", i + 1, full_track_name_clean, filetype);
         } else {
-            filename = format!("{}.flac", full_track_name_clean);
+            filename = format!("{}.{}", full_track_name_clean, filetype);
         }
         let joined_path = destination.join(&filename);
         let path = joined_path.to_str().unwrap();
@@ -148,10 +157,13 @@ async fn download_tracks(
 		}
 
         if !file_exists {
+            // switch audio sink audio format to match the file extension
+
 			let mut file_sink = file_sink::FileSink::open(
 			    Some(path.to_owned()),
-			    librespot::playback::config::AudioFormat::S16
+			    librespot::playback::config::AudioFormat::S16,
 			);
+            file_sink.set_filetype(filetype);
 			file_sink.add_metadata(metadata);
 			let (mut player, _) =
                 Player::new(player_config.clone(), session.clone(), None, move || {
@@ -225,6 +237,7 @@ async fn main() {
         PathBuf::from(opt.destination),
         tracks,
         opt.ordered,
+        opt.filetype,
     )
     .await;
 }

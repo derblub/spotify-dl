@@ -6,18 +6,28 @@ use librespot::{playback::{audio_backend::{Open, Sink, SinkError}, config::Audio
 // extern crate flac_bound;
 
 use flac_bound::{FlacEncoder};
+use symphonia::{Encoder as Mp3Encoder, StreamConfig as Mp3StreamConfig};
 
 use crate::TrackMetadata;
+
+enum FileType {
+    MP3,
+    FLAC,
+}
 
 pub struct FileSink {
     sink: String,
     content: Vec<i32>,
-    metadata: Option<TrackMetadata>
+    metadata: Option<TrackMetadata>,
+    file_type: FileType,
 }
 
 impl FileSink {
     pub fn add_metadata(&mut self, meta: TrackMetadata) {
         self.metadata = Some(meta);
+    }
+    pub fn set_file_type(&mut self, file_type: FileType) {
+        self.file_type = file_type;
     }
 }
 
@@ -27,7 +37,8 @@ impl Open for FileSink {
         FileSink {
             sink: file_path,
             content: Vec::new(),
-            metadata: None
+            metadata: None,
+            file_type: FileType::FLAC,
         }
     }
 }
@@ -38,13 +49,25 @@ impl Sink for FileSink {
     }
 
     fn stop(&mut self) -> Result<(), SinkError> {
-        let mut encoder = FlacEncoder::new().unwrap().channels(2).bits_per_sample(16).compression_level(4).init_file(&self.sink).unwrap();
-        encoder.process_interleaved(self.content.as_slice(), (self.content.len()/2) as u32).unwrap();
-        encoder.finish().unwrap();
+        match self.file_type {
+            FileType::FLAC => {
+                let mut encoder = FlacEncoder::new().unwrap().channels(2).bits_per_sample(16).compression_level(4).init_file(&self.sink).unwrap();
+                encoder.process_interleaved(self.content.as_slice(), (self.content.len()/2) as u32).unwrap();
+                encoder.finish().unwrap();
+            },
+            FileType::MP3 => {
+                let mut encoder = Mp3Encoder::new(&self.sink, Mp3StreamConfig::default()).unwrap();
+                encoder.encode(self.content.as_slice()).unwrap();
+                encoder.finish().unwrap();
+            },
+        }
 
         match &self.metadata {
             Some(meta) => {
-                let mut tag = Tag::new().with_tag_type(TagType::Flac).read_from_path(Path::new(&self.sink)).unwrap();
+                let mut tag = match self.file_type {
+                    FileType::FLAC => Tag::new().with_tag_type(TagType::Flac).read_from_path(Path::new(&self.sink)).unwrap(),
+                    FileType::MP3 => Tag::new().with_tag_type(TagType::MP3).read_from_path(Path::new(&self.sink)).unwrap(),
+                };
 
                 tag.set_album_title(&meta.album);
                 for artist in &meta.artists {
