@@ -5,7 +5,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use lazy_static::lazy_static;
 use librespot::core::session::Session;
-use librespot::core::spotify_id::SpotifyId;
+use librespot::core::{SpotifyId, SpotifyUri};
 use librespot::metadata::Metadata;
 use librespot::metadata::image::Image;
 use regex::Regex;
@@ -26,18 +26,15 @@ pub async fn get_tracks(spotify_ids: Vec<String>, session: &Session) -> Result<V
     let mut tracks: Vec<Track> = Vec::new();
     for id in spotify_ids {
         tracing::debug!("Getting tracks for: {}", id);
-        let id = parse_uri_or_url(&id).ok_or(anyhow::anyhow!("Invalid track"))?;
-        let new_tracks = match id.item_type {
-            librespot::core::spotify_id::SpotifyItemType::Track => vec![Track::from_id(id)],
-            librespot::core::spotify_id::SpotifyItemType::Episode => vec![Track::from_id(id)],
-            librespot::core::spotify_id::SpotifyItemType::Album => {
-                Album::from_id(id).get_tracks(session).await
+        let uri: SpotifyUri = parse_uri_or_url(&id).ok_or(anyhow::anyhow!("Invalid track"))?;
+        let new_tracks = match uri {
+            SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
+                vec![Track { uri: uri.clone(), position: None }]
             }
-            librespot::core::spotify_id::SpotifyItemType::Playlist => {
-                Playlist::from_id(id).get_tracks(session).await
-            }
+            SpotifyUri::Album { id } => Album::from_id(id).get_tracks(session).await,
+            SpotifyUri::Playlist { id, .. } => Playlist::from_id(id).get_tracks(session).await,
             _ => {
-                tracing::warn!("Unsupported item type: {:?}", id.item_type);
+                tracing::warn!("Unsupported item type: {:?}", id);
                 vec![]
             }
         };
@@ -47,29 +44,30 @@ pub async fn get_tracks(spotify_ids: Vec<String>, session: &Session) -> Result<V
     Ok(tracks)
 }
 
-fn parse_uri_or_url(track: &str) -> Option<SpotifyId> {
+fn parse_uri_or_url(track: &str) -> Option<SpotifyUri> {
     parse_uri(track).or_else(|| parse_url(track))
 }
 
-fn parse_uri(track_uri: &str) -> Option<SpotifyId> {
-    let res = SpotifyId::from_uri(track_uri);
+fn parse_uri(track_uri: &str) -> Option<SpotifyUri> {
+    let res = SpotifyUri::from_uri(track_uri);
     tracing::info!("Parsed URI: {:?}", res);
     res.ok()
 }
 
-fn parse_url(track_url: &str) -> Option<SpotifyId> {
+fn parse_url(track_url: &str) -> Option<SpotifyUri> {
     let results = SPOTIFY_URL_REGEX.captures(track_url)?;
     let uri = format!(
         "spotify:{}:{}",
         results.get(1)?.as_str(),
         results.get(2)?.as_str()
     );
-    SpotifyId::from_uri(&uri).ok()
+    SpotifyUri::from_uri(&uri).ok()
 }
 
 #[derive(Clone, Debug)]
 pub struct Track {
-    pub id: SpotifyId,
+    pub uri: SpotifyUri,
+    pub position: Option<usize>,
 }
 
 lazy_static! {
@@ -79,16 +77,12 @@ lazy_static! {
 
 impl Track {
     pub fn new(track: &str) -> Result<Self> {
-        let id = parse_uri_or_url(track).ok_or(anyhow::anyhow!("Invalid track"))?;
-        Ok(Track { id })
-    }
-
-    pub fn from_id(id: SpotifyId) -> Self {
-        Track { id }
+        let uri = parse_uri_or_url(track).ok_or(anyhow::anyhow!("Invalid track"))?;
+        Ok(Track { uri, position: None })
     }
 
     pub async fn metadata(&self, session: &Session) -> Result<TrackMetadata> {
-        let metadata = librespot::metadata::Track::get(session, &self.id)
+        let metadata = librespot::metadata::Track::get(session, &self.uri)
             .await
             .map_err(|_| anyhow::anyhow!("Failed to get metadata"))?;
 
@@ -118,10 +112,13 @@ impl Track {
             })
         });
 
+        let position = self.position;
+
         Ok(TrackMetadata::from(
             metadata,
             artists,
             album,
+            position,
             image_retriever,
         ))
     }
@@ -140,7 +137,12 @@ pub struct Album {
 
 impl Album {
     pub fn new(album: &str) -> Result<Self> {
-        let id = parse_uri_or_url(album).ok_or(anyhow::anyhow!("Invalid album"))?;
+        let id = parse_uri_or_url(album)
+            .and_then(|uri| match uri {
+                SpotifyUri::Album { id } => Some(id),
+                _ => None,
+            })
+            .ok_or(anyhow::anyhow!("Invalid album"))?;
         Ok(Album { id })
     }
 
@@ -148,7 +150,7 @@ impl Album {
         Album { id }
     }
 
-    pub async fn is_album(id: SpotifyId, session: &Session) -> bool {
+    pub async fn is_album(id: SpotifyUri, session: &Session) -> bool {
         librespot::metadata::Album::get(session, &id).await.is_ok()
     }
 }
@@ -156,28 +158,54 @@ impl Album {
 #[async_trait::async_trait]
 impl TrackCollection for Album {
     async fn get_tracks(&self, session: &Session) -> Vec<Track> {
-        let album = librespot::metadata::Album::get(session, &self.id)
-            .await
-            .expect("Failed to get album");
-        album.tracks().map(|track| Track::from_id(*track)).collect()
+        let uri = SpotifyUri::Album { id: self.id };
+        let mut last_err = String::new();
+        for attempt in 1..=3 {
+            match librespot::metadata::Album::get(session, &uri).await {
+                Ok(album) => {
+                    return album
+                        .tracks()
+                        .filter_map(|uri| match uri {
+                            SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
+                                Some(Track { uri: uri.clone(), position: None })
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    last_err = format!("{:?}", e);
+                    tracing::warn!("Attempt {}/3 to fetch album failed: {}", attempt, last_err);
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt * 3)).await;
+                }
+            }
+        }
+        tracing::error!("Failed to get album after 3 attempts: {}", last_err);
+        eprintln!("  ⚠ Failed to fetch album: {}", last_err);
+        vec![]
     }
 }
 
 pub struct Playlist {
-    id: SpotifyId,
+    uri: SpotifyUri,
 }
 
 impl Playlist {
     pub fn new(playlist: &str) -> Result<Self> {
-        let id = parse_uri_or_url(playlist).ok_or(anyhow::anyhow!("Invalid playlist"))?;
-        Ok(Playlist { id })
+        let uri = parse_uri_or_url(playlist).ok_or(anyhow::anyhow!("Invalid playlist"))?;
+        Ok(Playlist { uri })
     }
 
     pub fn from_id(id: SpotifyId) -> Self {
-        Playlist { id }
+        Playlist {
+            uri: SpotifyUri::Playlist {
+                user: None,
+                id,
+            },
+        }
     }
 
-    pub async fn is_playlist(id: SpotifyId, session: &Session) -> bool {
+    pub async fn is_playlist(id: SpotifyUri, session: &Session) -> bool {
         librespot::metadata::Playlist::get(session, &id)
             .await
             .is_ok()
@@ -187,22 +215,42 @@ impl Playlist {
 #[async_trait::async_trait]
 impl TrackCollection for Playlist {
     async fn get_tracks(&self, session: &Session) -> Vec<Track> {
-        let playlist = librespot::metadata::Playlist::get(session, &self.id)
-            .await
-            .expect("Failed to get playlist");
-        playlist
-            .tracks()
-            .map(|track| Track::from_id(*track))
-            .collect()
+        let mut last_err = String::new();
+        for attempt in 1..=3 {
+            match librespot::metadata::Playlist::get(session, &self.uri).await {
+                Ok(playlist) => {
+                    return playlist
+                        .tracks()
+                        .enumerate()
+                        .filter_map(|(i, uri)| match uri {
+                            SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
+                                Some(Track { uri: uri.clone(), position: Some(i + 1) })
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    last_err = format!("{:?}", e);
+                    tracing::warn!("Attempt {}/3 to fetch playlist failed: {}", attempt, last_err);
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt * 3)).await;
+                }
+            }
+        }
+        tracing::error!("Failed to get playlist after 3 attempts: {}", last_err);
+        eprintln!("  ⚠ Failed to fetch playlist: {}", last_err);
+        vec![]
     }
 }
 
-#[derive(Clone)]
 pub struct TrackMetadata {
     pub artists: Vec<ArtistMetadata>,
     pub track_name: String,
     pub album: AlbumMetadata,
     pub duration: i32,
+    pub track_number: i32,
+    pub disc_number: i32,
+    pub position: Option<usize>,
     image_retriever: AsyncFn<Bytes>,
 }
 
@@ -211,6 +259,7 @@ impl TrackMetadata {
         track: librespot::metadata::Track,
         artists: Vec<librespot::metadata::Artist>,
         album: librespot::metadata::Album,
+        position: Option<usize>,
         image_retriever: AsyncFn<Bytes>,
     ) -> Self {
         let artists = artists
@@ -224,6 +273,9 @@ impl TrackMetadata {
             track_name: track.name.clone(),
             album,
             duration: track.duration,
+            track_number: track.number,
+            disc_number: track.disc_number,
+            position,
             image_retriever,
         }
     }
@@ -243,13 +295,16 @@ impl TrackMetadata {
             artists: self.artists.iter().map(|a| a.name.clone()).collect(),
             album_title: self.album.name.clone(),
             album_cover: (self.image_retriever)().await,
+            track_number: if self.track_number > 0 { Some(self.track_number as u16) } else { None },
+            disc_number: if self.disc_number > 0 { Some(self.disc_number as u16) } else { None },
         };
         Ok(tags)
     }
 }
 
-impl ToString for TrackMetadata {
-    fn to_string(&self) -> String {
+impl TrackMetadata {
+    /// Returns the filename without any position prefix, e.g. "Artist - Song"
+    pub fn to_string_without_position(&self) -> String {
         if self.artists.len() > 3 {
             let artists_name = self
                 .artists
@@ -271,6 +326,14 @@ impl ToString for TrackMetadata {
             .collect::<Vec<String>>()
             .join(", ");
         clean_invalid_characters(format!("{} - {}", artists_name, self.track_name))
+    }
+}
+
+impl ToString for TrackMetadata {
+    fn to_string(&self) -> String {
+        let position_prefix = self.position.map_or(String::new(), |i| format!("{:02} - ", i));
+        let bare = self.to_string_without_position();
+        format!("{}{}", position_prefix, bare)
     }
 }
 

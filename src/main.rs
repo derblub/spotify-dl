@@ -42,6 +42,13 @@ struct Opt {
         help = "Force download even if the file already exists"
     )]
     force: bool,
+    #[structopt(
+        short = "r",
+        long = "rate-limit",
+        help = "Delay in seconds between downloading each track. Default is 60.",
+        default_value = "60"
+    )]
+    rate_limit: u64,
 }
 
 pub fn create_destination_if_required(destination: Option<String>) -> anyhow::Result<()> {
@@ -69,12 +76,13 @@ async fn main() -> anyhow::Result<()> {
     let session = create_session().await?;
 
     let track = get_tracks(opt.tracks, &session).await?;
+    println!("  {} tracks to process\n", track.len());
 
     let downloader = Downloader::new(session);
     downloader
         .download_tracks(
             track,
-            &DownloadOptions::new(opt.destination, opt.parallel, opt.format, opt.force),
+            &DownloadOptions::new(opt.destination, opt.parallel, opt.format, opt.force, opt.rate_limit),
         )
         .await
 }

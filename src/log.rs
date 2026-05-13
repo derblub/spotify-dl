@@ -73,6 +73,10 @@ pub fn configure_logger() -> Result<()> {
 
     let targets = filter::Targets::new()
         .with_target("spotify_dl", tracing::Level::DEBUG)
+        .with_target("librespot", tracing::Level::WARN)
+        .with_target("librespot_playback", tracing::Level::INFO)
+        .with_target("librespot_metadata", tracing::Level::WARN)
+        .with_target("librespot_core", tracing::Level::INFO)
         .with_default(LevelFilter::OFF);
 
     let console_layer = fmt::layer().with_target(false).with_filter(
