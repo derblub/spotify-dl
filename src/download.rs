@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +48,24 @@ impl DownloadOptions {
     }
 }
 
+/// Result of checking whether a track needs downloading.
+enum TrackAction {
+    /// Track needs to be downloaded from Spotify.
+    Download {
+        path: String,
+    },
+    /// Track was skipped (file already exists).
+    Skipped {
+        display_name: String,
+    },
+    /// Track was renamed from an old naming convention.
+    Renamed {
+        from: String,
+        to: String,
+        display_name: String,
+    },
+}
+
 impl Downloader {
     pub fn new(session: Session) -> Self {
         Downloader {
@@ -63,140 +82,216 @@ impl Downloader {
         let total = tracks.len();
         let rate_limit = Duration::from_secs(options.rate_limit_secs);
 
-        if options.rate_limit_secs > 0 {
-            println!("  ⏱ Rate limit: {}s delay between tracks\n", options.rate_limit_secs);
+        // Pre-scan destination directory for O(n) rename detection.
+        // Maps bare name (without track-number prefix) to full path.
+        let mut existing_files: HashMap<String, PathBuf> = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(&options.destination) {
+            let ext = options.format.extension();
+            for entry in entries.filter_map(|e| e.ok()) {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if let Some(stem) = file_name.strip_suffix(&format!(".{}", ext)) {
+                    // Extract bare name: strip leading "NN - " prefix if present
+                    let bare = strip_track_number_prefix(stem);
+                    existing_files.insert(bare.to_string(), entry.path());
+                }
+            }
         }
 
-        let mut last_was_download = false;
+        let mut last_download_at: Option<tokio::time::Instant> = None;
 
         for (index, track) in tracks.into_iter().enumerate() {
-            // Rate-limit: sleep only after an actual download, not after skips/renames
-            if last_was_download && options.rate_limit_secs > 0 {
-                tracing::info!("Rate limiting: waiting {}s before next track", options.rate_limit_secs);
-                tokio::time::sleep(rate_limit).await;
-            }
+            let position = index + 1;
+            let counter = format!("[{}/{}]", position, total);
+            let metadata = track.metadata(&self.session).await?;
+            let display_name = metadata.to_string();
 
-            last_was_download = self.download_track(track, options, index + 1, total).await?;
+            // Phase 1: Check what action is needed for this track
+            let action = self.check_track_status(
+                &metadata,
+                &display_name,
+                options,
+                &existing_files,
+            );
+
+            match action {
+                TrackAction::Download { ref path } => {
+                    // Rate-limit: if a previous download happened, wait for remaining time
+                    if let Some(last_at) = last_download_at {
+                        let elapsed = last_at.elapsed();
+                        if elapsed < rate_limit {
+                            let remaining = rate_limit - elapsed;
+                            self.show_rate_limit_countdown(remaining).await;
+                        }
+                    }
+
+                    // Phase 2: Perform the actual download
+                    let downloaded = self.perform_download(
+                        track,
+                        &metadata,
+                        &display_name,
+                        path,
+                        options,
+                        position,
+                        &counter,
+                    ).await?;
+
+                    if downloaded {
+                        last_download_at = Some(tokio::time::Instant::now());
+                    }
+                }
+                TrackAction::Skipped { ref display_name } => {
+                    println!("  {} Skipped {} (already exists)", counter, display_name);
+                    // Don't reset timer — let it keep counting through skips
+                }
+                TrackAction::Renamed { ref from, ref to, ref display_name } => {
+                    println!("  {} Renamed {} → {}", counter, from, to);
+                    // Don't reset timer — let it keep counting through renames
+
+                    // Update track number tag in the renamed file
+                    let renamed_path = options.destination.join(display_name)
+                        .with_extension(options.format.extension());
+                    if let Ok(mut tags) = metadata.tags().await {
+                        tags.track_number = Some(position as u16);
+                        tags.disc_number = None;
+                        let _ = encoder::tags::store_tags(
+                            renamed_path.to_string_lossy().to_string(),
+                            &tags,
+                            options.format,
+                        ).await;
+                    }
+
+                    // Update the pre-scan index: remove old entry, add new one
+                    let bare = metadata.to_string_without_position();
+                    existing_files.remove(&bare);
+                    existing_files.insert(bare, renamed_path);
+                }
+            }
         }
 
         Ok(())
     }
 
-    #[tracing::instrument(name = "download_track", skip(self))]
-    /// Returns Ok(true) if a download was performed, Ok(false) if skipped/renamed.
-    async fn download_track(&self, track: Track, options: &DownloadOptions, position: usize, total: usize) -> Result<bool> {
-        let counter = format!("[{}/{}]", position, total);
-        let metadata = track.metadata(&self.session).await?;
-        tracing::info!("Downloading track: {:?}", metadata.track_name);
-
+    /// Check whether a track needs downloading, can be skipped, or should be renamed.
+    fn check_track_status(
+        &self,
+        metadata: &TrackMetadata,
+        display_name: &str,
+        options: &DownloadOptions,
+        existing_files: &HashMap<String, PathBuf>,
+    ) -> TrackAction {
         let path = options
             .destination
-            .join(metadata.to_string())
+            .join(display_name)
             .with_extension(options.format.extension())
             .to_str()
-            .ok_or(anyhow::anyhow!("Could not set the output path"))?
+            .unwrap_or_default()
             .to_string();
 
+        // Already exists with correct name
         if !options.force && PathBuf::from(&path).exists() {
             tracing::info!(
                 "Skipping {}, file already exists. Use --force to force re-downloading the track",
                 &metadata.track_name
             );
-            println!("  {} Skipped {} (already exists)", counter, metadata.to_string());
-            return Ok(false);
+            return TrackAction::Skipped {
+                display_name: display_name.to_string(),
+            };
         }
 
         // Smart rename: check for existing files under old naming conventions
         if !options.force && metadata.position.is_some() {
-            let ext = options.format.extension();
             let bare_name = metadata.to_string_without_position();
             let expected_path = PathBuf::from(&path);
 
-            // Case 1: File exists without track number prefix (old format: "Artist - Song.ext")
-            let bare_path = options.destination.join(&bare_name).with_extension(ext);
-            if bare_path.exists() {
-                tracing::info!("Renaming {} -> {}", bare_path.display(), expected_path.display());
-                std::fs::rename(&bare_path, &expected_path)?;
-                // Update the track number tag in the renamed file
-                let mut tags = metadata.tags().await?;
-                tags.track_number = Some(position as u16);
-                tags.disc_number = None;
-                crate::encoder::tags::store_tags(path.clone(), &tags, options.format).await?;
-                println!("  {} Renamed {} → {}", counter, bare_path.file_name().unwrap().to_string_lossy(), expected_path.file_name().unwrap().to_string_lossy());
-                return Ok(false);
-            }
+            // Use pre-scanned index for O(1) lookup instead of O(n) directory scan
+            if let Some(old_path) = existing_files.get(&bare_name) {
+                if old_path != &expected_path && old_path.exists() {
+                    let from_name = old_path.file_name().unwrap().to_string_lossy().to_string();
+                    let to_name = expected_path.file_name().unwrap().to_string_lossy().to_string();
 
-            // Case 2: File exists with a different/stale track number (e.g. playlist reorder)
-            let stale_pattern = format!(" - {}", bare_name);
-            if let Ok(entries) = std::fs::read_dir(&options.destination) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let file_name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(stem) = file_name.strip_suffix(&format!(".{}", ext)) {
-                        // Match pattern: "NN - Artist - Song" where NN differs from current position
-                        if stem.ends_with(&stale_pattern)
-                            && stem.len() > stale_pattern.len()
-                        {
-                            let prefix = &stem[..stem.len() - stale_pattern.len()];
-                            if prefix.len() >= 2 && prefix.chars().all(|c| c.is_ascii_digit()) {
-                                let old_path = entry.path();
-                                if old_path != expected_path {
-                                    tracing::info!("Renaming (stale number) {} -> {}", old_path.display(), expected_path.display());
-                                    std::fs::rename(&old_path, &expected_path)?;
-                                    let mut tags = metadata.tags().await?;
-                                    tags.track_number = Some(position as u16);
-                                    tags.disc_number = None;
-                                    crate::encoder::tags::store_tags(path.clone(), &tags, options.format).await?;
-                                    println!("  {} Renamed {} → {}", counter, old_path.file_name().unwrap().to_string_lossy(), expected_path.file_name().unwrap().to_string_lossy());
-                                    return Ok(false);
-                                }
-                            }
-                        }
+                    tracing::info!("Renaming {} -> {}", old_path.display(), expected_path.display());
+                    if let Err(e) = std::fs::rename(old_path, &expected_path) {
+                        tracing::error!("Failed to rename: {}", e);
+                    } else {
+                        return TrackAction::Renamed {
+                            from: from_name,
+                            to: to_name,
+                            display_name: display_name.to_string(),
+                        };
                     }
                 }
             }
         }
 
-        let pb = self.add_progress_bar(&metadata, &counter);
+        TrackAction::Download {
+            path,
+        }
+    }
+
+    /// Perform the actual download, encode, and write for a track.
+    /// Returns Ok(true) if the download completed successfully.
+    #[tracing::instrument(name = "perform_download", skip(self, track, metadata))]
+    async fn perform_download(
+        &self,
+        track: Track,
+        metadata: &TrackMetadata,
+        display_name: &str,
+        path: &str,
+        options: &DownloadOptions,
+        position: usize,
+        counter: &str,
+    ) -> Result<bool> {
+        tracing::info!("Downloading track: {:?}", metadata.track_name);
+
+        let pb = self.add_progress_bar(metadata, counter);
 
         let stream = Stream::new(self.session.clone());
         let channel = match stream.stream(Arc::new(track)).await {
             Ok(channel) => channel,
             Err(e) => {
-                self.fail_with_error(&pb, &metadata.to_string(), e.to_string(), &counter);
+                self.fail_with_error(&pb, display_name, e.to_string(), counter);
                 return Ok(false);
             }
         };
 
-        let samples = match self.buffer_track(channel, &pb, &metadata, &counter).await {
+        let samples = match self.buffer_track(channel, &pb, metadata, counter).await {
             Ok(samples) => samples,
             Err(e) => {
-                self.fail_with_error(&pb, &metadata.to_string(), e.to_string(), &counter);
+                self.fail_with_error(&pb, display_name, e.to_string(), counter);
                 return Ok(false);
             }
         };
 
-        tracing::info!("Encoding track: {}", metadata.to_string());
-        pb.set_message(format!("{} Encoding {}", counter, metadata.to_string()));
+        tracing::info!("Encoding track: {}", display_name);
+        pb.set_message(format!("{} Encoding {}", counter, display_name));
 
         let encoder = crate::encoder::get_encoder(options.format);
         let stream = encoder.encode(samples).await?;
 
-        pb.set_message(format!("{} Writing {}", counter, metadata.to_string()));
+        pb.set_message(format!("{} Writing {}", counter, display_name));
         tracing::info!(
             "Writing track: {:?} to file: {}",
-            metadata.to_string(),
-            &path
+            display_name,
+            path
         );
-        stream.write_to_file(&path).await?;
+        stream.write_to_file(path).await?;
 
         let mut tags = metadata.tags().await?;
         // Override track number with playlist position
         tags.track_number = Some(position as u16);
         tags.disc_number = None; // disc number not meaningful for playlists
-        encoder::tags::store_tags(path, &tags, options.format).await?;
+        encoder::tags::store_tags(path.to_string(), &tags, options.format).await?;
 
-        pb.finish_with_message(format!("{} Downloaded {}", counter, metadata.to_string()));
+        pb.finish_with_message(format!("{} Downloaded {}", counter, display_name));
         Ok(true)
+    }
+
+    /// Wait for the rate limit to expire.
+    async fn show_rate_limit_countdown(&self, remaining: Duration) {
+        if remaining.is_zero() {
+            return;
+        }
+        tokio::time::sleep(remaining).await;
     }
 
     fn add_progress_bar(&self, track: &TrackMetadata, counter: &str) -> ProgressBar {
@@ -220,6 +315,7 @@ impl Downloader {
         metadata: &TrackMetadata,
         counter: &str,
     ) -> Result<Samples> {
+        let display_name = metadata.to_string();
         let mut samples = Vec::<i32>::new();
         while let Some(event) = rx.recv().await {
             match event {
@@ -248,14 +344,14 @@ impl Downloader {
                         "Retrying download, attempt {} of {}: {}",
                         attempt,
                         max_attempts,
-                        metadata.to_string()
+                        display_name
                     );
                     pb.set_message(format!(
                         "{} Retrying ({}/{}) {}",
                         counter,
                         attempt,
                         max_attempts,
-                        metadata.to_string()
+                        display_name
                     ));
                 }
             }
@@ -273,4 +369,19 @@ impl Downloader {
         tracing::error!("Failed to download {}: {}", name, e.into());
         pb.finish_with_message(console::style(format!("{} Failed! {}", counter, name)).red().to_string());
     }
+}
+
+/// Strip a leading track-number prefix like "01 - " from a filename stem.
+/// Returns the bare name portion.
+fn strip_track_number_prefix(stem: &str) -> &str {
+    // Match pattern: two or more digits followed by " - "
+    if stem.len() >= 5 {
+        if let Some(pos) = stem.find(" - ") {
+            let prefix = &stem[..pos];
+            if prefix.len() >= 2 && prefix.chars().all(|c| c.is_ascii_digit()) {
+                return &stem[pos + 3..];
+            }
+        }
+    }
+    stem
 }

@@ -1,53 +1,39 @@
+use clap::Parser;
+
 use spotify_dl::download::{DownloadOptions, Downloader};
 use spotify_dl::encoder::Format;
 use spotify_dl::log;
 use spotify_dl::session::create_session;
 use spotify_dl::track::get_tracks;
-use structopt::StructOpt;
 
-#[derive(Debug, StructOpt)]
-#[structopt(
+#[derive(Debug, Parser)]
+#[command(
     name = "spotify-dl",
     about = "A commandline utility to download music directly from Spotify"
 )]
 struct Opt {
-    #[structopt(
-        help = "A list of Spotify URIs or URLs (songs, podcasts, playlists or albums)",
-        required = true
-    )]
+    /// A list of Spotify URIs or URLs (songs, podcasts, playlists or albums)
+    #[arg(required = true)]
     tracks: Vec<String>,
-    #[structopt(
-        short = "d",
-        long = "destination",
-        help = "The directory where the songs will be downloaded"
-    )]
+
+    /// The directory where the songs will be downloaded
+    #[arg(short = 'd', long = "destination")]
     destination: Option<String>,
-    #[structopt(
-        short = "t",
-        long = "parallel",
-        help = "Number of parallel downloads. Default is 5.",
-        default_value = "5"
-    )]
+
+    /// Number of parallel downloads. Default is 5.
+    #[arg(short = 't', long = "parallel", default_value = "5")]
     parallel: usize,
-    #[structopt(
-        short = "f",
-        long = "format",
-        help = "The format to download the tracks in. Default is flac.",
-        default_value = "flac"
-    )]
+
+    /// The format to download the tracks in. Default is flac.
+    #[arg(short = 'f', long = "format", default_value = "flac")]
     format: Format,
-    #[structopt(
-        short = "F",
-        long = "force",
-        help = "Force download even if the file already exists"
-    )]
+
+    /// Force download even if the file already exists
+    #[arg(short = 'F', long = "force")]
     force: bool,
-    #[structopt(
-        short = "r",
-        long = "rate-limit",
-        help = "Delay in seconds between downloading each track. Default is 60.",
-        default_value = "60"
-    )]
+
+    /// Delay in seconds between downloading each track. Default is 60.
+    #[arg(short = 'r', long = "rate-limit", default_value = "60")]
     rate_limit: u64,
 }
 
@@ -65,7 +51,7 @@ pub fn create_destination_if_required(destination: Option<String>) -> anyhow::Re
 async fn main() -> anyhow::Result<()> {
     log::configure_logger()?;
 
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
     create_destination_if_required(opt.destination.clone())?;
 
     if opt.tracks.is_empty() {

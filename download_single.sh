@@ -49,23 +49,9 @@ function load_cache() {
 function refresh_cache() {
     echo -e "\n  ${DIM}Refreshing playlist cache...${RESET}"
 
-    # Source OAuth and fetch functions from start.sh
-    local start_sh
-    start_sh="$(dirname "$(readlink -f "$0")")/start.sh"
+    # Source shared library (provides OAuth, cache, and utility functions)
+    source "$(dirname "$(readlink -f "$0")")/lib.sh"
 
-    if [[ ! -f "$start_sh" ]]; then
-        echo -e "  ${RED}✗ start.sh not found${RESET}\n"
-        return 1
-    fi
-
-    # Extract needed functions from start.sh
-    eval "$(sed -n '/^function request_authorization/,/^}/p' "$start_sh")"
-    eval "$(sed -n '/^function refresh_access_token/,/^}/p' "$start_sh")"
-    eval "$(sed -n '/^function clean_filename/,/^}/p' "$start_sh")"
-    eval "$(sed -n '/^function fetch_all_playlist_names/,/^}/p' "$start_sh")"
-    eval "$(sed -n '/^function load_playlist_cache/,/^}/p' "$start_sh")"
-
-    # Global so eval'd functions can access it (bash scoping)
     declare -gA playlist_name_cache
 
     access_token=""
@@ -76,11 +62,8 @@ function refresh_cache() {
     request_authorization
     fetch_all_playlist_names
 
-    # Save cache directly (don't rely on eval'd save function)
-    > "$playlist_cache"
-    for uri in "${!playlist_name_cache[@]}"; do
-        echo "${uri}|${playlist_name_cache[$uri]}" >> "$playlist_cache"
-    done
+    # Save cache
+    save_playlist_cache
     touch "$playlist_cache"
 
     echo -e "  ${GREEN}✓ Cache updated (${#playlist_name_cache[@]} playlists)${RESET}\n"
@@ -195,7 +178,7 @@ for i in "${!formats[@]}"; do
 done
 
 full_path="${output_path}/${playlist_name}"
-current_field=0   # 0=format  1=path  2=download
+current_field=2   # 0=format  1=path  2=download
 FORM_LINES=7
 
 function print_form() {
@@ -282,12 +265,12 @@ mkdir -p "$dest_dir"
 
 echo -e "  ${DIM}Downloading ${BOLD}${playlist_name}${RESET}${DIM} as ${download_format}${RESET}\n"
 
-if "$spotify_dl" -d "$dest_dir" -f "$download_format" -t 1 "$uri"; then
+if "$spotify_dl" -d "$dest_dir" -f "$download_format" -t 1 -r "$rate_limit_secs" "$uri"; then
     meta_entry="${uri}|${dest_dir}"
     if ! grep -qF "$uri" "$metadata_file" 2>/dev/null; then
         echo "$meta_entry" >> "$metadata_file"
     else
-        sed -i "s|^${uri}|.*|${meta_entry}|" "$metadata_file" 2>/dev/null || true
+        sed -i "s|^${uri}|.*$|${meta_entry}|" "$metadata_file" 2>/dev/null || true
     fi
     echo -e "\n  ${GREEN}✓ Done${RESET} ${DIM}${dest_dir}${RESET}\n"
 else

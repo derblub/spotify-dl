@@ -26,6 +26,7 @@ client_secret="${SPOTIFY_CLIENT_SECRET:?Missing SPOTIFY_CLIENT_SECRET in .env}"
 redirect_uri="${SPOTIFY_REDIRECT_URI:?Missing SPOTIFY_REDIRECT_URI in .env}"
 output_path="${OUTPUT_PATH:?Missing OUTPUT_PATH in .env}"
 download_format="${DOWNLOAD_FORMAT:-mp3}"
+rate_limit_secs="${RATE_LIMIT_SECS:-60}"
 
 # Derived paths
 spotify_dl="${SCRIPT_DIR}/target/release/spotify-dl"
